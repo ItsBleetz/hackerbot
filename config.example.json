@@ -1,0 +1,14 @@
+{
+  "hackerone_base_url": "https://api.hackerone.com",
+  "state_file": "hackerbot.db",
+  "program_poll_interval": "30m",
+  "report_poll_interval": "5m",
+  "request_interval": "150ms",
+  "report_request_interval": "210ms",
+  "scope_request_interval": "1250ms",
+  "request_timeout": "30s",
+  "reports_enabled": true,
+  "report_notification_mode": "summary",
+  "report_notify_own_comments": false,
+  "report_threads_enabled": false
+}

@@ -1,0 +1,11 @@
+config.json
+.env
+.env.*
+!.env.example
+hackerbot-state.json
+hackerbot-state.json.tmp
+hackerbot.db
+hackerbot.db-shm
+hackerbot.db-wal
+*.json-backup*
+dist/
