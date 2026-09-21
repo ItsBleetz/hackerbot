@@ -25,6 +25,7 @@ type Config struct {
 	ReportRequestInterval   string `json:"report_request_interval"`
 	ScopeRequestInterval    string `json:"scope_request_interval"`
 	RequestTimeout          string `json:"request_timeout"`
+	ProgramsEnabled         bool   `json:"programs_enabled"`
 	ReportsEnabled          bool   `json:"reports_enabled"`
 	ReportNotificationMode  string `json:"report_notification_mode"`
 	ReportNotifyOwnComments bool   `json:"report_notify_own_comments"`
@@ -48,6 +49,7 @@ func defaultConfig() Config {
 		ReportRequestInterval:  "210ms",
 		ScopeRequestInterval:   "1250ms",
 		RequestTimeout:         "30s",
+		ProgramsEnabled:        true,
 		ReportsEnabled:         true,
 		ReportNotificationMode: "summary",
 	}
@@ -71,6 +73,9 @@ func loadConfig(path string) (Config, error) {
 	overrideEnv(&cfg.ReportWebhookURL, "DISCORD_REPORT_WEBHOOK")
 	overrideEnv(&cfg.StateFile, "HACKERBOT_STATE_FILE")
 	overrideEnv(&cfg.ReportNotificationMode, "HACKERBOT_REPORT_NOTIFICATION_MODE")
+	if err := overrideEnvBool(&cfg.ProgramsEnabled, "HACKERBOT_PROGRAMS_ENABLED"); err != nil {
+		return Config{}, err
+	}
 	if err := overrideEnvBool(&cfg.ReportsEnabled, "HACKERBOT_REPORTS_ENABLED"); err != nil {
 		return Config{}, err
 	}

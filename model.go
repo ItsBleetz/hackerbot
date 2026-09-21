@@ -99,6 +99,34 @@ func programHandle(raw json.RawMessage) (string, error) {
 	return envelope.Attributes.Handle, nil
 }
 
+func programState(raw json.RawMessage) (string, error) {
+	var envelope struct {
+		Attributes struct {
+			State string `json:"state"`
+		} `json:"attributes"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return "", err
+	}
+	return strings.ToLower(strings.TrimSpace(envelope.Attributes.State)), nil
+
+}
+
+func programIsPrivate(raw json.RawMessage) (bool, error) {
+	state, err := programState(raw)
+	if err != nil {
+		return false, err
+	}
+	switch state {
+	case "soft_launched":
+		return true, nil
+	case "public_mode":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unrecognized state %q", state)
+	}
+}
+
 func canonicalRaw(raw json.RawMessage) json.RawMessage {
 	var value any
 	if json.Unmarshal(raw, &value) != nil {

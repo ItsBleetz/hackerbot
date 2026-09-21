@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "1.7.0"
+const version = "1.8.0"
 
 func main() {
 	os.Exit(run())
@@ -46,13 +46,13 @@ func run() int {
 		log.Printf("configuration error: %v", err)
 		return 2
 	}
-	if strings.TrimSpace(cfg.ProgramWebhookURL) == "" {
-		log.Printf("configuration error: set DISCORD_PROGRAM_WEBHOOK")
-		return 2
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if *dummy {
+		if strings.TrimSpace(cfg.ProgramWebhookURL) == "" {
+			log.Printf("configuration error: set DISCORD_PROGRAM_WEBHOOK for -dummy")
+			return 2
+		}
 		if strings.TrimSpace(cfg.ReportWebhookURL) == "" {
 			log.Printf("configuration error: set DISCORD_REPORT_WEBHOOK for -dummy")
 			return 2
@@ -73,6 +73,10 @@ func run() int {
 	monitor := newMonitor(cfg, store)
 
 	if strings.TrimSpace(*handle) != "" {
+		if strings.TrimSpace(cfg.ProgramWebhookURL) == "" {
+			log.Printf("configuration error: set DISCORD_PROGRAM_WEBHOOK for -handle")
+			return 2
+		}
 		if err := monitor.SendHandle(ctx, strings.TrimSpace(*handle)); err != nil {
 			log.Printf("send program: %v", err)
 			return 1
@@ -81,6 +85,14 @@ func run() int {
 		return 0
 	}
 
+	programsActive := cfg.ProgramsEnabled && strings.TrimSpace(cfg.ProgramWebhookURL) != ""
+	if !cfg.ProgramsEnabled {
+		log.Printf("private-program monitoring disabled by programs_enabled=false")
+	}
+	if cfg.ProgramsEnabled && !programsActive {
+		log.Printf("configuration error: set DISCORD_PROGRAM_WEBHOOK or set programs_enabled=false")
+		return 2
+	}
 	reportsActive := cfg.ReportsEnabled && strings.TrimSpace(cfg.ReportWebhookURL) != ""
 	if !cfg.ReportsEnabled {
 		log.Printf("report monitoring disabled by reports_enabled=false")
@@ -90,9 +102,11 @@ func run() int {
 	}
 	if *once {
 		failed := false
-		if err := monitor.CheckPrograms(ctx); err != nil {
-			log.Printf("program check failed: %v", err)
-			failed = true
+		if programsActive {
+			if err := monitor.CheckPrograms(ctx); err != nil {
+				log.Printf("private-program check failed: %v", err)
+				failed = true
+			}
 		}
 		if reportsActive {
 			if err := monitor.CheckReports(ctx); err != nil {
@@ -106,13 +120,15 @@ func run() int {
 		return 0
 	}
 
-	log.Printf("starting program monitor every %s", cfg.programPoll)
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runSchedule(ctx, cfg.programPoll, "program", monitor.CheckPrograms)
-	}()
+	if programsActive {
+		log.Printf("starting private-program monitor every %s", cfg.programPoll)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runSchedule(ctx, cfg.programPoll, "private-program", monitor.CheckPrograms)
+		}()
+	}
 	if reportsActive {
 		log.Printf("starting report monitor every %s", cfg.reportPoll)
 		wg.Add(1)
@@ -120,6 +136,10 @@ func run() int {
 			defer wg.Done()
 			runSchedule(ctx, cfg.reportPoll, "report", monitor.CheckReports)
 		}()
+	}
+	if !programsActive && !reportsActive {
+		log.Printf("no monitors enabled; nothing to run")
+		return 0
 	}
 	wg.Wait()
 	log.Printf("hackerbot stopped")

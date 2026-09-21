@@ -66,23 +66,32 @@ func (m *Monitor) CheckPrograms(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("list programs: %w", err)
 	}
+	listedPrivate := make(map[string]json.RawMessage)
 	handles := make([]string, 0, len(listed))
 	for _, raw := range listed {
 		handle, err := programHandle(raw)
 		if err != nil {
 			return fmt.Errorf("decode listed program: %w", err)
 		}
+		private, err := programIsPrivate(raw)
+		if err != nil {
+			return fmt.Errorf("listed program %s has %w; refusing to update the private-program baseline", handle, err)
+		}
+		if !private {
+			continue
+		}
+		listedPrivate[handle] = raw
 		handles = append(handles, handle)
 	}
 	sort.Strings(handles)
 
 	current := make(map[string]ProgramSnapshot, len(handles))
 	for _, handle := range handles {
-		snapshot, err := m.FetchProgram(ctx, handle)
-		if err != nil {
-			return err
+		current[handle] = ProgramSnapshot{
+			Handle:     handle,
+			Program:    listedPrivate[handle],
+			CapturedAt: time.Now().UTC(),
 		}
-		current[handle] = snapshot
 	}
 
 	previous, err := m.store.Snapshot()
@@ -93,7 +102,7 @@ func (m *Monitor) CheckPrograms(ctx context.Context) error {
 		if err := m.store.InitializePrograms(current); err != nil {
 			return err
 		}
-		log.Printf("program baseline created with %d programs; no Discord messages sent", len(current))
+		log.Printf("private-program baseline created with %d programs; no Discord messages sent", len(current))
 		return nil
 	}
 	sentProgramNotification := false
@@ -111,33 +120,23 @@ func (m *Monitor) CheckPrograms(ctx context.Context) error {
 	}
 
 	for _, handle := range handles {
-		next := current[handle]
-		old, exists := previous.Programs[handle]
-		if !exists {
-			change := ProgramChange{Kind: "new", Handle: handle, After: &next}
-			if err := sendProgramNotification(change); err != nil {
-				log.Printf("notify new program %s: %v", handle, err)
-				continue
-			}
-			if err := m.setProgram(handle, next); err != nil {
-				return err
-			}
-			log.Printf("notified new program %s", handle)
+		if _, exists := previous.Programs[handle]; exists {
 			continue
 		}
-		details := diffProgram(old, next)
-		if len(details) == 0 {
+		next, err := m.FetchProgram(ctx, handle)
+		if err != nil {
+			log.Printf("fetch new private program %s: %v", handle, err)
 			continue
 		}
-		change := ProgramChange{Kind: "changed", Handle: handle, Details: details, Before: &old, After: &next}
+		change := ProgramChange{Kind: "new", Handle: handle, After: &next}
 		if err := sendProgramNotification(change); err != nil {
-			log.Printf("notify changed program %s: %v", handle, err)
+			log.Printf("notify new private program %s: %v", handle, err)
 			continue
 		}
 		if err := m.setProgram(handle, next); err != nil {
 			return err
 		}
-		log.Printf("notified %d changes for program %s", len(details), handle)
+		log.Printf("notified new private program %s", handle)
 	}
 
 	removed, err := m.store.UpdateProgramPresence(current)
@@ -145,7 +144,7 @@ func (m *Monitor) CheckPrograms(ctx context.Context) error {
 		return err
 	}
 	for _, handle := range removed {
-		log.Printf("program %s was absent from two complete checks; removed from baseline without notification", handle)
+		log.Printf("program %s was absent from two complete private-program checks; removed from baseline without notification", handle)
 	}
 	return nil
 }

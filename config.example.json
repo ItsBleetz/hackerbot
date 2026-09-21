@@ -7,6 +7,7 @@
   "report_request_interval": "210ms",
   "scope_request_interval": "1250ms",
   "request_timeout": "30s",
+  "programs_enabled": true,
   "reports_enabled": true,
   "report_notification_mode": "summary",
   "report_notify_own_comments": false,

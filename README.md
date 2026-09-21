@@ -3,19 +3,18 @@
 [![CI](https://github.com/ItsBleetz/hackerbot/actions/workflows/ci.yml/badge.svg)](https://github.com/ItsBleetz/hackerbot/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/ItsBleetz/hackerbot)](https://github.com/ItsBleetz/hackerbot/releases/latest)
 
-Hackerbot monitors the programs and reports available to a HackerOne researcher account and sends changes to Discord. It uses only HackerOne's documented Hacker API.
+Hackerbot watches for newly accepted private programs and monitors reports available to a HackerOne researcher account, then sends notifications to Discord. It uses only HackerOne's documented Hacker API.
 
 ## What it does
 
-- Retrieves every paginated program visible to the authenticated hacker, including accepted private programs.
-- Retrieves each program's complete program object, structured scopes, and scope exclusions.
-- Creates a silent baseline on the first successful run.
-- Notifies Discord when a program is added or changed.
+- Retrieves the paginated program list and watches only programs whose Hacker API state is `soft_launched` (accepted private programs).
+- Creates a silent private-program baseline on the first successful run without fetching every program's scope.
+- Notifies Discord only when a new private program appears. Existing program changes and all public programs are ignored.
+- Fetches the complete program object, structured scopes, and scope exclusions only for a newly discovered private program (or an explicit `-handle`/`-dummy` request).
 - Sends a concise, styled Discord overview first, then uploads one complete standalone HTML program report in a second ordered message.
 - Places a visual divider between consecutive program notifications.
-- For changed programs, names the changed parts in Discord and includes every full before/after value in the HTML.
 - Includes the full policy, a HackerOne-style structured scope table, exclusions, researcher-specific program statistics, and raw API snapshot in the HTML without silent truncation. Scope assets are ordered Critical, High, Medium, Low, then None, with assets alphabetical inside each severity.
-- Can be disabled completely, or monitors reports owned by the authenticated hacker for new reports, status changes, comments, and every new activity type returned by the Hacker API.
+- Program and report monitoring can be disabled independently. Report monitoring covers owned reports, including new reports, status changes, comments, and every new activity type returned by the Hacker API.
 - Uses a separate Discord webhook for report notifications.
 - Optionally keeps each report's events in one Discord Forum/Media thread.
 - Stores current program and report snapshots transactionally in an embedded SQLite database.
@@ -36,6 +35,7 @@ HACKERONE_API_TOKEN=your_hackerone_api_token
 DISCORD_PROGRAM_WEBHOOK=https://discord.com/api/webhooks/...
 DISCORD_REPORT_WEBHOOK=https://discord.com/api/webhooks/...
 HACKERBOT_REPORT_NOTIFICATION_MODE=summary
+HACKERBOT_PROGRAMS_ENABLED=true
 HACKERBOT_REPORTS_ENABLED=true
 HACKERBOT_REPORT_NOTIFY_OWN_COMMENTS=false
 HACKERBOT_REPORT_THREADS_ENABLED=false
@@ -43,21 +43,22 @@ HACKERBOT_REPORT_THREADS_ENABLED=false
 
 Existing operating-system environment variables take precedence over values in `.env`. Use `-env C:\secure\hackerbot.env` to select another file; an explicitly selected missing or malformed file is an error.
 
-Required:
+Always required:
 
 | Environment variable | Purpose |
 | --- | --- |
 | `HACKERONE_USERNAME` | API token identifier (the Basic-auth username), not an email address |
 | `HACKERONE_API_TOKEN` | Personal HackerOne API token |
-| `DISCORD_PROGRAM_WEBHOOK` | Webhook for program notifications and `-handle` |
 
 Optional:
 
 | Environment variable | Purpose |
 | --- | --- |
+| `DISCORD_PROGRAM_WEBHOOK` | Required when program monitoring is enabled or when using `-handle`/`-dummy`; may be omitted for a report-only process with `programs_enabled=false` |
 | `DISCORD_REPORT_WEBHOOK` | Enables report monitoring and notifications |
 | `HACKERBOT_STATE_FILE` | Overrides the configured state-file location |
 | `HACKERBOT_REPORT_NOTIFICATION_MODE` | Overrides `report_notification_mode` |
+| `HACKERBOT_PROGRAMS_ENABLED` | `false` disables all automatic program API reads and notifications; `-handle` and `-dummy` remain available |
 | `HACKERBOT_REPORTS_ENABLED` | `false` disables all report API reads and notifications |
 | `HACKERBOT_REPORT_NOTIFY_OWN_COMMENTS` | `true` also sends comments authored by the report's researcher |
 | `HACKERBOT_REPORT_THREADS_ENABLED` | `true` enables one Discord Forum/Media thread per report |
@@ -66,13 +67,14 @@ JSON settings:
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `program_poll_interval` | `30m` | How often all programs and scopes are checked |
+| `program_poll_interval` | `30m` | How often the program list is checked for newly visible private programs |
 | `report_poll_interval` | `5m` | How often owned reports are checked |
 | `request_interval` | `150ms` | Shared delay between HackerOne API reads |
 | `report_request_interval` | `210ms` | Additional delay between report-list/detail reads |
 | `scope_request_interval` | `1250ms` | Additional delay between structured-scope requests |
 | `request_timeout` | `30s` | HTTP request timeout |
 | `state_file` | `hackerbot.db` | SQLite database, relative to the config file |
+| `programs_enabled` | `true` | Enables private-program polling; defaults to `true` when omitted for compatibility with older configurations |
 | `reports_enabled` | `true` | Enables report polling when its webhook is configured; `false` makes no report API calls |
 | `report_notification_mode` | `summary` | `summary` hides report titles and comment bodies; `detailed` includes them |
 | `report_notify_own_comments` | `false` | Send comments whose actor is the report's researcher |
@@ -218,15 +220,17 @@ SQLite is embedded into each executable; the Windows server does not need SQLite
 
 ## First-run and failure behavior
 
-Program and report baselines are independent. Each first successful check writes its baseline and sends no Discord notification. If `reports_enabled` is false or the report webhook is absent, report monitoring remains disabled and no report baseline is created.
+Program and report baselines are independent. Each first successful enabled check writes its baseline and sends no Discord notification. The program baseline contains only accepted private handles and is created directly from the list response; it does not fetch details or scopes for programs that already exist at initialization. If `programs_enabled` is false, Hackerbot makes no automatic program API calls. If `reports_enabled` is false or the report webhook is absent, report monitoring remains disabled and no report baseline is created.
 
-State is stored in the `metadata`, `programs`, and `reports` tables in `hackerbot.db`. Program handles and report IDs are primary keys; each row contains the complete latest API snapshot as JSON. SQLite runs in WAL mode and all baseline updates use transactions.
+State is stored in the `metadata`, `programs`, and `reports` tables in `hackerbot.db`. Program handles and report IDs are primary keys. A baseline private-program row contains the program-list resource; a private program discovered later contains the complete detail and scope snapshot used for its notification. SQLite runs in WAL mode and all baseline updates use transactions.
 
-After initialization, Hackerbot updates a changed snapshot only after Discord accepts the corresponding message. A failed webhook delivery is therefore retried during the next poll. An incomplete HackerOne collection fails the entire check so a temporary API error cannot look like removed programs.
+After initialization, Hackerbot uses handle presence—not content comparison—to detect new private programs. It does not fetch or compare existing private-program details or scopes. A new handle is stored only after Discord accepts its notification, so a failed delivery is retried during the next poll. An incomplete HackerOne collection fails the entire check so a temporary API error cannot look like removed programs.
 
-Program notifications use two awaited Discord requests per program: the summary/change embeds are accepted first, then the timestamped HTML file is uploaded. A visual divider is sent before the next program in the batch. When several programs need notifications, handles are processed alphabetically. Inside the HTML, sections are ordered as overview, changes, guidelines, scope, exclusions, then raw API data.
+The private filter recognizes only HackerOne's `soft_launched` state and ignores only `public_mode`. If a list item has a missing or unknown state, the whole program check stops without updating presence counters or the baseline. This fail-closed behavior prevents an API shape change from removing known programs and later re-announcing them.
 
-A program missing from two consecutive complete collections is silently removed from the baseline. If access is later restored, it is treated as newly added. Hackerbot intentionally does not send program-removal notifications.
+Program notifications use two awaited Discord requests per program: the new-program summary is accepted first, then the timestamped HTML file is uploaded. A visual divider is sent before the next program in the batch. When several programs need notifications, handles are processed alphabetically. Inside the HTML, sections are ordered as overview, guidelines, scope, exclusions, then raw API data.
+
+A private program missing from two consecutive complete list collections is silently removed from the baseline. If access is later restored, it is treated as newly added. Hackerbot intentionally does not send program-removal notifications. On upgrade from a version that stored public programs, those legacy public rows age out through this same silent two-check process and never produce notifications.
 
 If the configured state path contains a state file from the older JSON version, Hackerbot automatically imports it into SQLite. The original is preserved next to it with a `.json-backup` suffix.
 

@@ -380,23 +380,41 @@ func TestProgramHTMLScopeUsesSeverityOrderAndWideAssets(t *testing.T) {
 	}
 }
 
-func TestFirstProgramCheckIsSilentAndSecondSends(t *testing.T) {
-	var policy atomic.Int32
-	policy.Store(1)
+func TestProgramWatchBaselinesPrivateOnlyIgnoresChangesAndSendsNewPrivate(t *testing.T) {
+	var phase atomic.Int32
 	var discordCalls atomic.Int32
+	var requestsMu sync.Mutex
+	requests := make(map[string]int)
 
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsMu.Lock()
+		requests[r.URL.Path]++
+		requestsMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/hackers/programs":
-			fmt.Fprint(w, `{"data":[{"id":"1","type":"program","attributes":{"handle":"acme"}}],"links":{}}`)
-		case "/v1/hackers/programs/acme":
-			fmt.Fprintf(w, `{"data":{"id":"1","type":"program","attributes":{"handle":"acme","name":"Acme","policy":"v%d"}}}`, policy.Load())
-		case "/v1/hackers/programs/acme/structured_scopes":
-			fmt.Fprint(w, `{"data":[{"id":"1","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"https://example.com","eligible_for_submission":true,"eligible_for_bounty":true}}],"links":{}}`)
-		case "/v1/hackers/programs/acme/scope_exclusions":
+			newPrograms := ""
+			policy := "baseline"
+			if phase.Load() >= 1 {
+				policy = "changed-but-ignored"
+			}
+			if phase.Load() >= 2 {
+				newPrograms = `,
+					{"id":"3","type":"program","attributes":{"handle":"new-private","state":"soft_launched"}},
+					{"id":"4","type":"program","attributes":{"handle":"new-public","state":"public_mode"}}`
+			}
+			fmt.Fprintf(w, `{"data":[
+				{"id":"1","type":"program","attributes":{"handle":"existing-private","state":"soft_launched","policy":%q}},
+				{"id":"2","type":"program","attributes":{"handle":"existing-public","state":"public_mode"}}%s
+			],"links":{}}`, policy, newPrograms)
+		case "/v1/hackers/programs/new-private":
+			fmt.Fprint(w, `{"data":{"id":"3","type":"program","attributes":{"handle":"new-private","name":"New Private","state":"soft_launched","policy":"private policy"}}}`)
+		case "/v1/hackers/programs/new-private/structured_scopes":
+			fmt.Fprint(w, `{"data":[{"id":"1","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"https://private.example","eligible_for_submission":true,"eligible_for_bounty":true}}],"links":{}}`)
+		case "/v1/hackers/programs/new-private/scope_exclusions":
 			fmt.Fprint(w, `{"data":[],"links":{}}`)
 		default:
+			t.Errorf("unexpected HackerOne request: %s", r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
@@ -429,12 +447,19 @@ func TestFirstProgramCheckIsSilentAndSecondSends(t *testing.T) {
 	if discordCalls.Load() != 0 {
 		t.Fatalf("first run sent %d webhooks", discordCalls.Load())
 	}
-	policy.Store(2)
+	phase.Store(1)
+	if err := monitor.CheckPrograms(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if discordCalls.Load() != 0 {
+		t.Fatalf("existing private-program change sent %d webhooks", discordCalls.Load())
+	}
+	phase.Store(2)
 	if err := monitor.CheckPrograms(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if discordCalls.Load() != 2 {
-		t.Fatalf("second run sent %d webhooks, want summary then HTML", discordCalls.Load())
+		t.Fatalf("new private program sent %d webhooks, want summary then HTML", discordCalls.Load())
 	}
 	stateBytes, err := os.ReadFile(cfg.StateFile)
 	if err != nil {
@@ -447,8 +472,156 @@ func TestFirstProgramCheckIsSilentAndSecondSends(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(state.Programs["acme"].Program), `"policy":"v2"`) {
-		t.Fatalf("program state was not advanced: %s", state.Programs["acme"].Program)
+	if len(state.Programs) != 2 {
+		t.Fatalf("stored programs = %v, want only two private programs", state.Programs)
+	}
+	if !strings.Contains(string(state.Programs["existing-private"].Program), `"policy":"baseline"`) {
+		t.Fatalf("existing program snapshot changed despite change monitoring being disabled: %s", state.Programs["existing-private"].Program)
+	}
+	if len(state.Programs["new-private"].Scopes) != 1 {
+		t.Fatalf("new private program scope was not stored: %+v", state.Programs["new-private"])
+	}
+	if _, exists := state.Programs["existing-public"]; exists {
+		t.Fatal("public program was stored in the baseline")
+	}
+	if _, exists := state.Programs["new-public"]; exists {
+		t.Fatal("new public program was stored or notified")
+	}
+	requestsMu.Lock()
+	defer requestsMu.Unlock()
+	if requests["/v1/hackers/programs"] != 3 {
+		t.Fatalf("program list requests = %d, want 3", requests["/v1/hackers/programs"])
+	}
+	if requests["/v1/hackers/programs/existing-private"] != 0 || requests["/v1/hackers/programs/existing-public"] != 0 || requests["/v1/hackers/programs/new-public"] != 0 {
+		t.Fatalf("existing/public program details were fetched: %v", requests)
+	}
+	for _, path := range []string{
+		"/v1/hackers/programs/new-private",
+		"/v1/hackers/programs/new-private/structured_scopes",
+		"/v1/hackers/programs/new-private/scope_exclusions",
+	} {
+		if requests[path] != 1 {
+			t.Fatalf("new private request %s count = %d, want 1", path, requests[path])
+		}
+	}
+}
+
+func TestProgramIsPrivateUsesSoftLaunchedStateOnly(t *testing.T) {
+	tests := []struct {
+		state   string
+		want    bool
+		wantErr bool
+	}{
+		{"soft_launched", true, false},
+		{"SOFT_LAUNCHED", true, false},
+		{"public_mode", false, false},
+		{"private_mode", false, true},
+		{"", false, true},
+	}
+	for _, test := range tests {
+		raw := json.RawMessage(fmt.Sprintf(`{"attributes":{"state":%q}}`, test.state))
+		got, err := programIsPrivate(raw)
+		if (err != nil) != test.wantErr {
+			t.Errorf("programIsPrivate(%q) error = %v, wantErr %v", test.state, err, test.wantErr)
+			continue
+		}
+		if !test.wantErr && got != test.want {
+			t.Errorf("programIsPrivate(%q) = %v, want %v", test.state, got, test.want)
+		}
+	}
+}
+
+func TestProgramWatchUnknownStateDoesNotAlterBaseline(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[{"id":"1","type":"program","attributes":{"handle":"mystery","state":"new_api_state"}}],"links":{}}`)
+	}))
+	defer api.Close()
+
+	cfg := testConfig(api.URL)
+	store, err := openStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.InitializePrograms(map[string]ProgramSnapshot{
+		"known-private": {Handle: "known-private", Program: json.RawMessage(`{"attributes":{"handle":"known-private","state":"soft_launched"}}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = newMonitor(cfg, store).CheckPrograms(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unrecognized state") {
+		t.Fatalf("unknown program state error = %v", err)
+	}
+	state, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := state.Programs["known-private"]; !exists || state.MissingPrograms["known-private"] != 0 {
+		t.Fatalf("unknown state altered the baseline: %+v", state)
+	}
+}
+
+func TestProgramWatchUpgradeSilentlyRemovesLegacyPublicRows(t *testing.T) {
+	var apiCalls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalls.Add(1)
+		if r.URL.Path != "/v1/hackers/programs" {
+			t.Errorf("unexpected detail request during upgrade cleanup: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[
+			{"id":"1","type":"program","attributes":{"handle":"private","state":"soft_launched"}},
+			{"id":"2","type":"program","attributes":{"handle":"public","state":"public_mode"}}
+		],"links":{}}`)
+	}))
+	defer api.Close()
+
+	var discordCalls atomic.Int32
+	discord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		discordCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer discord.Close()
+
+	cfg := testConfig(api.URL)
+	cfg.ProgramWebhookURL = discord.URL
+	store, err := openStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.InitializePrograms(map[string]ProgramSnapshot{
+		"private": {Handle: "private", Program: json.RawMessage(`{"attributes":{"handle":"private","state":"soft_launched"}}`)},
+		"public":  {Handle: "public", Program: json.RawMessage(`{"attributes":{"handle":"public","state":"public_mode"}}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	monitor := newMonitor(cfg, store)
+	for range 2 {
+		if err := monitor.CheckPrograms(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Programs) != 1 {
+		t.Fatalf("stored programs after upgrade cleanup = %v", state.Programs)
+	}
+	if _, exists := state.Programs["private"]; !exists {
+		t.Fatal("private program was removed during upgrade cleanup")
+	}
+	if _, exists := state.Programs["public"]; exists {
+		t.Fatal("legacy public program was not removed after two checks")
+	}
+	if apiCalls.Load() != 2 || discordCalls.Load() != 0 {
+		t.Fatalf("upgrade cleanup made %d API calls and %d Discord calls, want two list calls and no notifications", apiCalls.Load(), discordCalls.Load())
 	}
 }
 
@@ -841,6 +1014,7 @@ func TestOptionalDotEnvMayBeMissing(t *testing.T) {
 }
 
 func TestReportConfigSwitchesAndEnvironmentOverrides(t *testing.T) {
+	t.Setenv("HACKERBOT_PROGRAMS_ENABLED", "false")
 	t.Setenv("HACKERBOT_REPORTS_ENABLED", "false")
 	t.Setenv("HACKERBOT_REPORT_NOTIFY_OWN_COMMENTS", "true")
 	t.Setenv("HACKERBOT_REPORT_THREADS_ENABLED", "true")
@@ -860,8 +1034,14 @@ func TestReportConfigSwitchesAndEnvironmentOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.ReportsEnabled || !cfg.ReportNotifyOwnComments || !cfg.ReportThreadsEnabled {
-		t.Fatalf("report switches were not overridden: enabled=%v own=%v threads=%v", cfg.ReportsEnabled, cfg.ReportNotifyOwnComments, cfg.ReportThreadsEnabled)
+	if cfg.ProgramsEnabled || cfg.ReportsEnabled || !cfg.ReportNotifyOwnComments || !cfg.ReportThreadsEnabled {
+		t.Fatalf("monitor switches were not overridden: programs=%v reports=%v own=%v threads=%v", cfg.ProgramsEnabled, cfg.ReportsEnabled, cfg.ReportNotifyOwnComments, cfg.ReportThreadsEnabled)
+	}
+}
+
+func TestProgramWatchDefaultsEnabledForOldConfigurations(t *testing.T) {
+	if !defaultConfig().ProgramsEnabled {
+		t.Fatal("programs_enabled must default to true for backward compatibility")
 	}
 }
 
