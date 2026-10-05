@@ -1708,3 +1708,186 @@ func TestExampleFilesAreValidAndAgree(t *testing.T) {
 		}
 	}
 }
+
+// TestEndToEndNewPrivateProgramOnlyWithScopeInTheHTML is the behavioral
+// contract: weekly/6h intervals, only newly visible private programs reach
+// Discord, an existing program's scope change is ignored and never even
+// fetched, and the HTML that Discord receives carries the full scope table.
+func TestEndToEndNewPrivateProgramOnlyWithScopeInTheHTML(t *testing.T) {
+	var phase atomic.Int32
+	var requestsMu sync.Mutex
+	requests := make(map[string]int)
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsMu.Lock()
+		requests[r.URL.Path]++
+		requestsMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hackers/programs":
+			extra := ""
+			if phase.Load() >= 1 {
+				extra = `,{"id":"3","type":"program","attributes":{"handle":"brand-new","state":"soft_launched"}}` +
+					`,{"id":"4","type":"program","attributes":{"handle":"a-public-one","state":"public_mode"}}`
+			}
+			fmt.Fprintf(w, `{"data":[
+				{"id":"1","type":"program","attributes":{"handle":"already-known","state":"soft_launched"}},
+				{"id":"2","type":"program","attributes":{"handle":"public-known","state":"public_mode"}}%s
+			],"links":{}}`, extra)
+		case "/v1/hackers/programs/brand-new":
+			fmt.Fprint(w, `{"data":{"id":"3","type":"program","attributes":{"handle":"brand-new","name":"Brand New Co","state":"soft_launched","submission_state":"open","offers_bounties":true,"currency":"usd","policy":"## Rules\n\nFind bugs in *.brandnew.example and report them."}}}`)
+		case "/v1/hackers/programs/brand-new/structured_scopes":
+			fmt.Fprint(w, `{"data":[
+				{"id":"11","type":"structured-scope","attributes":{"asset_type":"OTHER","asset_identifier":"BrandNew Android app","max_severity":"medium","eligible_for_submission":true,"eligible_for_bounty":false}},
+				{"id":"12","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"*.brandnew.example","max_severity":"critical","eligible_for_submission":true,"eligible_for_bounty":true}},
+				{"id":"13","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"api.brandnew.example","max_severity":"high","eligible_for_submission":true,"eligible_for_bounty":true}}
+			],"links":{}}`)
+		case "/v1/hackers/programs/brand-new/scope_exclusions":
+			fmt.Fprint(w, `{"data":[{"id":"21","type":"scope-exclusion","attributes":{"category":"Rate limiting","details":"Volumetric testing is excluded."}}],"links":{}}`)
+		default:
+			t.Errorf("UNEXPECTED HackerOne request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+
+	type received struct {
+		hasFile  bool
+		fileName string
+		html     []byte
+		payload  discordPayload
+	}
+	var mu sync.Mutex
+	var got []received
+	discord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entry := received{}
+		reader, err := r.MultipartReader()
+		if err != nil {
+			t.Errorf("multipart reader: %v", err)
+			http.Error(w, "bad", http.StatusBadRequest)
+			return
+		}
+		for {
+			part, err := reader.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Errorf("next part: %v", err)
+				return
+			}
+			data, readErr := io.ReadAll(part)
+			if readErr != nil {
+				t.Errorf("read part: %v", readErr)
+				return
+			}
+			if part.FormName() == "payload_json" && part.FileName() == "" {
+				if err := json.Unmarshal(data, &entry.payload); err != nil {
+					t.Errorf("decode payload: %v", err)
+				}
+			} else if part.FileName() != "" {
+				entry.hasFile = true
+				entry.fileName = part.FileName()
+				entry.html = data
+			}
+		}
+		mu.Lock()
+		got = append(got, entry)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer discord.Close()
+
+	cfg := testConfig(api.URL)
+	cfg.ProgramWebhookURL = discord.URL
+	cfg.StateFile = filepath.Join(t.TempDir(), "e2e.db")
+	store, err := openStateStore(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	monitor := newMonitor(cfg, store)
+
+	// Pass 1: baseline. Silent, and no detail or scope read for anything.
+	if err := monitor.CheckPrograms(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	baselineMessages := len(got)
+	mu.Unlock()
+	if baselineMessages != 0 {
+		t.Fatalf("baseline sent %d Discord messages, want 0", baselineMessages)
+	}
+
+	// Pass 2: one new private program appears, one new public program appears.
+	phase.Store(1)
+	if err := monitor.CheckPrograms(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 {
+		t.Fatalf("got %d Discord messages, want 2 (summary then HTML)", len(got))
+	}
+	if got[0].hasFile {
+		t.Fatal("the first message must be the summary embed, not the attachment")
+	}
+	if len(got[0].payload.Embeds) == 0 || !strings.Contains(got[0].payload.Embeds[0].Title, "Brand New Co") {
+		t.Fatalf("summary embed does not name the program: %+v", got[0].payload.Embeds)
+	}
+	if !got[1].hasFile {
+		t.Fatal("the second message must carry the HTML attachment")
+	}
+
+	// The HTML that Discord actually received must contain the scope table.
+	html := string(got[1].html)
+	t.Logf("attachment %q, %d bytes", got[1].fileName, len(got[1].html))
+	if dir := os.Getenv("HACKERBOT_DUMP_HTML"); dir != "" {
+		_ = os.WriteFile(filepath.Join(dir, got[1].fileName), got[1].html, 0o600)
+	}
+	if !strings.Contains(html, `<table class="scope-table"`) {
+		t.Fatal("the HTML Discord received has no structured scope table")
+	}
+	for _, want := range []string{
+		"*.brandnew.example", "api.brandnew.example", "BrandNew Android app",
+		"Rate limiting", "Volumetric testing is excluded.",
+		"3 structured asset(s)", "Find bugs in",
+	} {
+		if !strings.Contains(html, want) {
+			t.Errorf("the HTML Discord received is missing %q", want)
+		}
+	}
+	critical := strings.Index(html, "*.brandnew.example")
+	high := strings.Index(html, "api.brandnew.example")
+	medium := strings.Index(html, "BrandNew Android app")
+	if !(critical < high && high < medium) {
+		t.Errorf("scope table is not severity-ordered: critical=%d high=%d medium=%d", critical, high, medium)
+	}
+
+	// No scope monitoring: the already-known private program is never re-read,
+	// and no public program is ever fetched.
+	requestsMu.Lock()
+	defer requestsMu.Unlock()
+	for _, path := range []string{
+		"/v1/hackers/programs/already-known",
+		"/v1/hackers/programs/already-known/structured_scopes",
+		"/v1/hackers/programs/already-known/scope_exclusions",
+		"/v1/hackers/programs/public-known",
+		"/v1/hackers/programs/a-public-one",
+	} {
+		if requests[path] != 0 {
+			t.Errorf("%s was requested %d time(s); existing and public programs must never be fetched", path, requests[path])
+		}
+	}
+	for _, path := range []string{
+		"/v1/hackers/programs/brand-new",
+		"/v1/hackers/programs/brand-new/structured_scopes",
+		"/v1/hackers/programs/brand-new/scope_exclusions",
+	} {
+		if requests[path] != 1 {
+			t.Errorf("%s requested %d time(s), want 1", path, requests[path])
+		}
+	}
+	t.Logf("HackerOne requests: %v", requests)
+}
