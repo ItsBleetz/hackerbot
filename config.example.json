@@ -1,15 +1,15 @@
 {
   "hackerone_base_url": "https://api.hackerone.com",
   "state_file": "hackerbot.db",
-  "program_poll_interval": "30m",
-  "report_poll_interval": "5m",
+  "program_poll_interval": "168h",
+  "report_poll_interval": "6h",
   "request_interval": "150ms",
   "report_request_interval": "210ms",
   "scope_request_interval": "1250ms",
   "request_timeout": "30s",
   "programs_enabled": true,
   "reports_enabled": true,
-  "report_notification_mode": "summary",
-  "report_notify_own_comments": false,
-  "report_threads_enabled": false
+  "report_notification_mode": "detailed",
+  "report_notify_own_comments": true,
+  "report_threads_enabled": true
 }

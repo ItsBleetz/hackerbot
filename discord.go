@@ -529,20 +529,35 @@ func programOverviewEmbed(name string, attrs map[string]any, snapshot ProgramSna
 		description = "Program information received from the HackerOne Hacker API."
 	}
 
+	footerText := "Hackerbot • Complete HTML program report attached"
+	if snapshot.ScopeOmitted {
+		footerText = "Hackerbot • HTML program report attached · scope not requested"
+	}
+
 	embed := discordEmbed{
 		Title:       abbreviate(kindLabel+" • "+name, 256),
 		URL:         "https://hackerone.com/" + url.PathEscape(snapshot.Handle),
 		Description: description,
 		Color:       programColor(change.Kind),
 		Timestamp:   notificationTimestamp(snapshot.CapturedAt),
-		Footer:      &discordFooter{Text: "Hackerbot • Complete HTML program report attached"},
+		Footer:      &discordFooter{Text: footerText},
 		Fields: []discordEmbedField{
 			{Name: "🏷️ Handle", Value: "`" + abbreviate(snapshot.Handle, 200) + "`", Inline: true},
 			{Name: "🚦 Availability", Value: programAvailability(attrs), Inline: true},
 			{Name: "🎁 Rewards", Value: programRewards(attrs), Inline: true},
-			{Name: "🎯 Scope", Value: programScopeSummary(snapshot.Scopes), Inline: true},
-			{Name: "🚫 Exclusions", Value: fmt.Sprintf("**%d** documented", len(snapshot.ScopeExclusions)), Inline: true},
 		},
+	}
+	if snapshot.ScopeOmitted {
+		embed.Fields = append(embed.Fields, discordEmbedField{
+			Name:   "🎯 Scope",
+			Value:  "Not requested · open the program on HackerOne",
+			Inline: true,
+		})
+	} else {
+		embed.Fields = append(embed.Fields,
+			discordEmbedField{Name: "🎯 Scope", Value: programScopeSummary(snapshot.Scopes), Inline: true},
+			discordEmbedField{Name: "🚫 Exclusions", Value: fmt.Sprintf("**%d** documented", len(snapshot.ScopeExclusions)), Inline: true},
+		)
 	}
 	if picture := absoluteH1URL(stringValue(attrs["profile_picture"])); picture != "" {
 		embed.Thumbnail = &discordThumbnail{URL: picture}
@@ -792,6 +807,7 @@ func (d *DiscordClient) sendResult(ctx context.Context, webhook string, payload 
 		}
 		req.Header.Set("Content-Type", contentType)
 		req.Header.Set("User-Agent", "hackerbot/"+version)
+		countersFrom(ctx).countDiscord(attempt)
 		resp, err := d.http.Do(req)
 		if err != nil {
 			return nil, discordTransportError(err)

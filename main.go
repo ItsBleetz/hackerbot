@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "1.8.0"
+const version = "1.9.0"
 
 func main() {
 	os.Exit(run())
@@ -25,6 +25,7 @@ func run() int {
 	handle := flag.String("handle", "", "fetch one program and send it immediately")
 	dummy := flag.Bool("dummy", false, "fetch three programs and two reports from HackerOne and preview them in Discord without changing SQLite")
 	once := flag.Bool("once", false, "run enabled monitors once and exit")
+	reset := flag.String("reset", "", "discard a stored baseline and exit: programs, reports, or all; the next run rebuilds it silently from today's state")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -57,7 +58,9 @@ func run() int {
 			log.Printf("configuration error: set DISCORD_REPORT_WEBHOOK for -dummy")
 			return 2
 		}
-		if err := sendDummyNotifications(ctx, cfg); err != nil {
+		if err := runCheck(ctx, "live preview", func(ctx context.Context) error {
+			return sendDummyNotifications(ctx, cfg)
+		}); err != nil {
 			log.Printf("dummy Discord test failed: %v", err)
 			return 1
 		}
@@ -70,6 +73,15 @@ func run() int {
 		return 2
 	}
 	defer store.Close()
+
+	if strings.TrimSpace(*reset) != "" {
+		if err := resetBaselines(store, strings.TrimSpace(*reset)); err != nil {
+			log.Printf("reset error: %v", err)
+			return 2
+		}
+		return 0
+	}
+
 	monitor := newMonitor(cfg, store)
 
 	if strings.TrimSpace(*handle) != "" {
@@ -77,7 +89,9 @@ func run() int {
 			log.Printf("configuration error: set DISCORD_PROGRAM_WEBHOOK for -handle")
 			return 2
 		}
-		if err := monitor.SendHandle(ctx, strings.TrimSpace(*handle)); err != nil {
+		if err := runCheck(ctx, "program snapshot", func(ctx context.Context) error {
+			return monitor.SendHandle(ctx, strings.TrimSpace(*handle))
+		}); err != nil {
 			log.Printf("send program: %v", err)
 			return 1
 		}
@@ -103,13 +117,13 @@ func run() int {
 	if *once {
 		failed := false
 		if programsActive {
-			if err := monitor.CheckPrograms(ctx); err != nil {
+			if err := runCheck(ctx, "private-program", monitor.CheckPrograms); err != nil {
 				log.Printf("private-program check failed: %v", err)
 				failed = true
 			}
 		}
 		if reportsActive {
-			if err := monitor.CheckReports(ctx); err != nil {
+			if err := runCheck(ctx, "report", monitor.CheckReports); err != nil {
 				log.Printf("report check failed: %v", err)
 				failed = true
 			}
@@ -146,8 +160,42 @@ func run() int {
 	return 0
 }
 
+// resetBaselines discards the selected baselines and exits without contacting
+// HackerOne or Discord, so the next run re-baselines silently at today's state
+// and notifies only about what happens afterwards.
+func resetBaselines(store *StateStore, selection string) error {
+	resetPrograms := false
+	resetReports := false
+	switch strings.ToLower(selection) {
+	case "programs":
+		resetPrograms = true
+	case "reports":
+		resetReports = true
+	case "all", "both":
+		resetPrograms = true
+		resetReports = true
+	default:
+		return fmt.Errorf("-reset must be programs, reports, or all: %q", selection)
+	}
+	if resetPrograms {
+		discarded, err := store.ResetPrograms()
+		if err != nil {
+			return fmt.Errorf("reset program baseline: %w", err)
+		}
+		log.Printf("discarded the private-program baseline (%d stored program(s)); the next program check will rebuild it silently and notify only about programs added after it", discarded)
+	}
+	if resetReports {
+		discarded, err := store.ResetReports()
+		if err != nil {
+			return fmt.Errorf("reset report baseline: %w", err)
+		}
+		log.Printf("discarded the report baseline (%d stored report(s), including any stored Discord thread IDs); the next report check will rebuild it silently and notify only about events after it", discarded)
+	}
+	return nil
+}
+
 func runSchedule(ctx context.Context, interval time.Duration, name string, check func(context.Context) error) {
-	if err := check(ctx); err != nil && ctx.Err() == nil {
+	if err := runCheck(ctx, name, check); err != nil && ctx.Err() == nil {
 		log.Printf("%s check failed: %v", name, err)
 	}
 	ticker := time.NewTicker(interval)
@@ -157,9 +205,20 @@ func runSchedule(ctx context.Context, interval time.Duration, name string, check
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := check(ctx); err != nil && ctx.Err() == nil {
+			if err := runCheck(ctx, name, check); err != nil && ctx.Err() == nil {
 				log.Printf("%s check failed: %v", name, err)
 			}
 		}
 	}
+}
+
+// runCheck counts every HackerOne and Discord request the check makes and
+// reports the tally once the interval's work is finished, including when the
+// check fails partway through.
+func runCheck(ctx context.Context, name string, check func(context.Context) error) error {
+	ctx, counters := withRequestCounters(ctx)
+	started := time.Now()
+	err := check(ctx)
+	log.Printf("%s check finished in %s; %s", name, time.Since(started).Round(time.Millisecond), counters.Summary())
+	return err
 }

@@ -43,8 +43,8 @@ func defaultConfig() Config {
 	return Config{
 		HackerOneBaseURL:       "https://api.hackerone.com",
 		StateFile:              "hackerbot.db",
-		ProgramPollInterval:    "30m",
-		ReportPollInterval:     "5m",
+		ProgramPollInterval:    "168h",
+		ReportPollInterval:     "6h",
 		RequestInterval:        "150ms",
 		ReportRequestInterval:  "210ms",
 		ScopeRequestInterval:   "1250ms",

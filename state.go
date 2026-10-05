@@ -258,6 +258,39 @@ func (s *StateStore) SetReport(id string, snapshot ReportSnapshot) error {
 	return s.withTx(func(tx *sql.Tx) error { return upsertReport(tx, id, snapshot) })
 }
 
+// ResetPrograms and ResetReports drop a baseline so the next successful check
+// rebuilds it silently from the current API state. They are the supported way
+// to start notifying from today without replaying everything that accumulated
+// while Hackerbot was not running. Each returns the number of discarded rows.
+func (s *StateStore) ResetPrograms() (int64, error) {
+	return s.resetBaseline("programs", "programs_initialized")
+}
+
+func (s *StateStore) ResetReports() (int64, error) {
+	return s.resetBaseline("reports", "reports_initialized")
+}
+
+func (s *StateStore) resetBaseline(table, metadataKey string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var discarded int64
+	err := s.withTx(func(tx *sql.Tx) error {
+		// The table name is one of two package constants, never user input.
+		result, err := tx.Exec(`DELETE FROM ` + table)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err == nil {
+			discarded = affected
+		}
+		return setMetadata(tx, metadataKey, "false")
+	})
+	if err != nil {
+		return 0, err
+	}
+	return discarded, nil
+}
+
 func (s *StateStore) withTx(fn func(*sql.Tx) error) error {
 	tx, err := s.db.Begin()
 	if err != nil {

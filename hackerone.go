@@ -111,6 +111,7 @@ func (c *H1Client) request(ctx context.Context, target string, class requestClas
 		if err != nil {
 			return nil, err
 		}
+		countersFrom(ctx).countHackerOne(class, attempt)
 		req.SetBasicAuth(c.username, c.token)
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("User-Agent", "hackerbot/"+version)

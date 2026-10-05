@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -409,10 +410,6 @@ func TestProgramWatchBaselinesPrivateOnlyIgnoresChangesAndSendsNewPrivate(t *tes
 			],"links":{}}`, policy, newPrograms)
 		case "/v1/hackers/programs/new-private":
 			fmt.Fprint(w, `{"data":{"id":"3","type":"program","attributes":{"handle":"new-private","name":"New Private","state":"soft_launched","policy":"private policy"}}}`)
-		case "/v1/hackers/programs/new-private/structured_scopes":
-			fmt.Fprint(w, `{"data":[{"id":"1","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"https://private.example","eligible_for_submission":true,"eligible_for_bounty":true}}],"links":{}}`)
-		case "/v1/hackers/programs/new-private/scope_exclusions":
-			fmt.Fprint(w, `{"data":[],"links":{}}`)
 		default:
 			t.Errorf("unexpected HackerOne request: %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -478,8 +475,15 @@ func TestProgramWatchBaselinesPrivateOnlyIgnoresChangesAndSendsNewPrivate(t *tes
 	if !strings.Contains(string(state.Programs["existing-private"].Program), `"policy":"baseline"`) {
 		t.Fatalf("existing program snapshot changed despite change monitoring being disabled: %s", state.Programs["existing-private"].Program)
 	}
-	if len(state.Programs["new-private"].Scopes) != 1 {
-		t.Fatalf("new private program scope was not stored: %+v", state.Programs["new-private"])
+	stored := state.Programs["new-private"]
+	if !stored.ScopeOmitted {
+		t.Fatalf("new private program snapshot does not record the omitted scope: %+v", stored)
+	}
+	if len(stored.Scopes) != 0 || len(stored.ScopeExclusions) != 0 {
+		t.Fatalf("new private program stored scope data: %+v", stored)
+	}
+	if !strings.Contains(string(stored.Program), `"policy":"private policy"`) {
+		t.Fatalf("new private program detail was not stored: %s", stored.Program)
 	}
 	if _, exists := state.Programs["existing-public"]; exists {
 		t.Fatal("public program was stored in the baseline")
@@ -495,13 +499,15 @@ func TestProgramWatchBaselinesPrivateOnlyIgnoresChangesAndSendsNewPrivate(t *tes
 	if requests["/v1/hackers/programs/existing-private"] != 0 || requests["/v1/hackers/programs/existing-public"] != 0 || requests["/v1/hackers/programs/new-public"] != 0 {
 		t.Fatalf("existing/public program details were fetched: %v", requests)
 	}
+	if requests["/v1/hackers/programs/new-private"] != 1 {
+		t.Fatalf("new private detail requests = %d, want 1", requests["/v1/hackers/programs/new-private"])
+	}
 	for _, path := range []string{
-		"/v1/hackers/programs/new-private",
 		"/v1/hackers/programs/new-private/structured_scopes",
 		"/v1/hackers/programs/new-private/scope_exclusions",
 	} {
-		if requests[path] != 1 {
-			t.Fatalf("new private request %s count = %d, want 1", path, requests[path])
+		if requests[path] != 0 {
+			t.Fatalf("new-program check requested %s %d time(s); scope must not be fetched", path, requests[path])
 		}
 	}
 }
@@ -1209,4 +1215,492 @@ func testConfig(baseURL string) Config {
 
 func serverURL(r *http.Request) string {
 	return "http://" + r.Host
+}
+
+func TestNewProgramNotificationStatesScopeWasNotRequested(t *testing.T) {
+	program := json.RawMessage(`{"id":"7","type":"program","attributes":{"handle":"new-private","name":"New Private","state":"soft_launched","policy":"# Rules\n\nTest the login flow."}}`)
+	snapshot := ProgramSnapshot{
+		Handle:       "new-private",
+		Program:      program,
+		ScopeOmitted: true,
+		CapturedAt:   time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC),
+	}
+	change := ProgramChange{Kind: "new", Handle: "new-private", After: &snapshot}
+
+	embed := programOverviewEmbed("New Private", objectAttributes(program), snapshot, change, "new-private-program.html")
+	var scopeField *discordEmbedField
+	for index := range embed.Fields {
+		if strings.Contains(embed.Fields[index].Name, "Scope") {
+			scopeField = &embed.Fields[index]
+		}
+		if strings.Contains(embed.Fields[index].Name, "Exclusions") {
+			t.Fatalf("embed advertises an exclusion count that was never requested: %+v", embed.Fields[index])
+		}
+	}
+	if scopeField == nil {
+		t.Fatalf("embed has no scope field: %+v", embed.Fields)
+	}
+	if !strings.Contains(scopeField.Value, "Not requested") {
+		t.Fatalf("scope field = %q, want it to say the scope was not requested", scopeField.Value)
+	}
+	if !strings.Contains(embed.Footer.Text, "scope not requested") {
+		t.Fatalf("footer = %q, want it to state the scope was not requested", embed.Footer.Text)
+	}
+
+	page, err := programHTML(change)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(page)
+	if strings.Contains(html, "No structured scope was returned by the Hacker API.") {
+		t.Fatal("HTML claims the API returned no scope when the scope was never requested")
+	}
+	if !strings.Contains(html, "Structured scope was not requested.") {
+		t.Fatal("HTML scope section does not state that the scope was not requested")
+	}
+	if !strings.Contains(html, "Scope exclusions were not requested.") {
+		t.Fatal("HTML exclusion section does not state that exclusions were not requested")
+	}
+	if !strings.Contains(html, "Test the login flow.") {
+		t.Fatal("HTML dropped the program policy, which the program object does carry")
+	}
+	if !strings.Contains(html, "structured_scopes") {
+		t.Fatal("HTML raw API section is missing the structured_scopes key")
+	}
+	raw, err := programJSON(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"structured_scopes": null`) {
+		t.Fatalf("raw API snapshot should report scope as null, not an empty collection: %s", raw)
+	}
+}
+
+func TestPollIntervalDefaultsAreWeeklyProgramsAndSixHourReports(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"hackerone_username":"id","hackerone_api_token":"token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.programPoll != 168*time.Hour {
+		t.Fatalf("program poll interval = %s, want 168h (one week)", cfg.programPoll)
+	}
+	if cfg.reportPoll != 6*time.Hour {
+		t.Fatalf("report poll interval = %s, want 6h", cfg.reportPoll)
+	}
+}
+
+func TestRequestCountersTallyPerCheckAndStayIsolated(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hackers/programs":
+			fmt.Fprint(w, `{"data":[{"id":"1","type":"program","attributes":{"handle":"new-private","state":"soft_launched"}}],"links":{}}`)
+		case "/v1/hackers/programs/new-private":
+			fmt.Fprint(w, `{"data":{"id":"1","type":"program","attributes":{"handle":"new-private","name":"New Private","state":"soft_launched"}}}`)
+		case "/v1/hackers/me/reports":
+			fmt.Fprint(w, `{"data":[{"id":"9","type":"report","attributes":{"state":"new"}}],"links":{}}`)
+		case "/v1/hackers/reports/9":
+			fmt.Fprint(w, `{"data":{"id":"9","type":"report","attributes":{"state":"new","title":"t"}}}`)
+		default:
+			t.Errorf("unexpected HackerOne request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	discord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer discord.Close()
+
+	cfg := testConfig(api.URL)
+	cfg.ProgramWebhookURL = discord.URL
+	cfg.ReportWebhookURL = discord.URL
+	cfg.ReportNotificationMode = "summary"
+	cfg.reportDelay = time.Nanosecond
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.db")
+	store, err := openStateStore(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	monitor := newMonitor(cfg, store)
+
+	// Baseline pass: one program list read, and one report list plus one detail.
+	programCtx, programCounters := withRequestCounters(context.Background())
+	if err := monitor.CheckPrograms(programCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := programCounters.general.Load(); got != 1 {
+		t.Fatalf("program baseline general requests = %d, want 1", got)
+	}
+	if got := programCounters.report.Load(); got != 0 {
+		t.Fatalf("program check counted %d report requests; counters must stay per check", got)
+	}
+	if got := programCounters.scope.Load(); got != 0 {
+		t.Fatalf("program check made %d scope requests, want 0", got)
+	}
+	if got := programCounters.discord.Load(); got != 0 {
+		t.Fatalf("silent baseline sent %d Discord requests", got)
+	}
+	if got := programCounters.HackerOneTotal(); got != 1 {
+		t.Fatalf("HackerOne total = %d, want 1", got)
+	}
+	if got := programCounters.DiscordTotal(); got != 0 {
+		t.Fatalf("Discord total = %d, want 0", got)
+	}
+	summary := programCounters.Summary()
+	if !strings.Contains(summary, "HackerOne API: 1 requests") || !strings.Contains(summary, "Discord: 0 requests") {
+		t.Fatalf("summary = %q, want HackerOne and Discord counted separately", summary)
+	}
+
+	reportCtx, reportCounters := withRequestCounters(context.Background())
+	if err := monitor.CheckReports(reportCtx); err != nil {
+		t.Fatal(err)
+	}
+	if got := reportCounters.report.Load(); got != 2 {
+		t.Fatalf("report baseline report requests = %d, want 2 (list plus detail)", got)
+	}
+	if got := reportCounters.general.Load(); got != 0 {
+		t.Fatalf("report check counted %d general requests", got)
+	}
+
+	// An uncounted context must not panic or allocate a tally.
+	if err := monitor.CheckPrograms(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := (*requestCounters)(nil).Summary(); got != "HackerOne API: 0 requests | Discord: 0 requests" {
+		t.Fatalf("nil counters summary = %q", got)
+	}
+}
+
+func TestRequestCountersCountRetriedRequests(t *testing.T) {
+	var attempts atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":[],"links":{}}`)
+	}))
+	defer api.Close()
+
+	client := newH1Client(testConfig(api.URL))
+	ctx, counters := withRequestCounters(context.Background())
+	if _, err := client.Programs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := counters.general.Load(); got != 2 {
+		t.Fatalf("general requests = %d, want 2 (the 429 and the retry)", got)
+	}
+	if got := counters.hackerOneRetry.Load(); got != 1 {
+		t.Fatalf("HackerOne retries = %d, want 1", got)
+	}
+	if got := counters.discordRetry.Load(); got != 0 {
+		t.Fatalf("Discord retries = %d, want 0; the retry was a HackerOne retry", got)
+	}
+	if summary := counters.Summary(); !strings.Contains(summary, "HackerOne API: 2 requests (2 list/detail, 0 report, 0 scope, 1 retried)") {
+		t.Fatalf("summary = %q, want the retry attributed to HackerOne only", summary)
+	}
+}
+
+func TestResetReportBaselineRebuildsSilentlyFromCurrentState(t *testing.T) {
+	var reportCalls atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hackers/me/reports":
+			fmt.Fprint(w, `{"data":[{"id":"9","type":"report","attributes":{"state":"triaged"}}],"links":{}}`)
+		case "/v1/hackers/reports/9":
+			reportCalls.Add(1)
+			fmt.Fprint(w, `{"data":{"id":"9","type":"report","attributes":{"state":"triaged","title":"t"}}}`)
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	var discordCalls atomic.Int32
+	discord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		discordCalls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer discord.Close()
+
+	cfg := testConfig(api.URL)
+	cfg.ReportWebhookURL = discord.URL
+	cfg.ReportNotificationMode = "summary"
+	cfg.reportDelay = time.Nanosecond
+	cfg.StateFile = filepath.Join(t.TempDir(), "state.db")
+	store, err := openStateStore(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// A stale baseline that still remembers a Discord thread.
+	stale := map[string]ReportSnapshot{"9": {
+		ID:              "9",
+		Summary:         json.RawMessage(`{"id":"9","type":"report","attributes":{"state":"new"}}`),
+		Report:          json.RawMessage(`{"id":"9","type":"report","attributes":{"state":"new","title":"t"}}`),
+		DiscordThreadID: "555",
+		CapturedAt:      time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC),
+	}}
+	if err := store.InitializeReports(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	discarded, err := store.ResetReports()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if discarded != 1 {
+		t.Fatalf("discarded %d rows, want 1", discarded)
+	}
+	state, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ReportsInitialized {
+		t.Fatal("reports_initialized is still true after the reset")
+	}
+	if len(state.Reports) != 0 {
+		t.Fatalf("reset left %d report rows", len(state.Reports))
+	}
+
+	// The next check must re-baseline silently at the current state, not replay
+	// the stale new -> triaged transition.
+	monitor := newMonitor(cfg, store)
+	if err := monitor.CheckReports(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if discordCalls.Load() != 0 {
+		t.Fatalf("re-baseline sent %d Discord messages, want 0", discordCalls.Load())
+	}
+	state, err = store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.ReportsInitialized {
+		t.Fatal("re-baseline did not mark reports as initialized")
+	}
+	if got := state.Reports["9"].DiscordThreadID; got != "" {
+		t.Fatalf("re-baseline kept stale thread ID %q", got)
+	}
+	if !strings.Contains(string(state.Reports["9"].Report), `"state":"triaged"`) {
+		t.Fatalf("re-baseline did not capture today's state: %s", state.Reports["9"].Report)
+	}
+	if reportCalls.Load() != 1 {
+		t.Fatalf("re-baseline fetched report detail %d times, want 1", reportCalls.Load())
+	}
+
+	// A following check with no further change stays silent.
+	if err := monitor.CheckReports(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if discordCalls.Load() != 0 {
+		t.Fatalf("unchanged report sent %d Discord messages", discordCalls.Load())
+	}
+}
+
+func TestResetProgramBaselineAndSelectionValidation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	store, err := openStateStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.InitializePrograms(map[string]ProgramSnapshot{
+		"acme": {Handle: "acme", Program: json.RawMessage(`{"id":"1","attributes":{"handle":"acme"}}`)},
+		"beta": {Handle: "beta", Program: json.RawMessage(`{"id":"2","attributes":{"handle":"beta"}}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := resetBaselines(store, "programs"); err != nil {
+		t.Fatal(err)
+	}
+	state, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ProgramsInitialized || len(state.Programs) != 0 {
+		t.Fatalf("program baseline survived the reset: initialized=%v rows=%d", state.ProgramsInitialized, len(state.Programs))
+	}
+	// Resetting an already-empty baseline is a no-op, not an error.
+	if err := resetBaselines(store, "all"); err != nil {
+		t.Fatal(err)
+	}
+	if err := resetBaselines(store, "everything"); err == nil {
+		t.Fatal("invalid -reset selection was accepted")
+	}
+}
+
+// TestFreshDatabaseBaselinesBothMonitorsSilentlyThenNotifies covers the
+// start-clean path: deleting the state file makes the first run record both
+// baselines without sending anything, so notifications begin from that run.
+func TestFreshDatabaseBaselinesBothMonitorsSilentlyThenNotifies(t *testing.T) {
+	var phase atomic.Int32
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/hackers/programs":
+			extra := ""
+			if phase.Load() >= 1 {
+				extra = `,{"id":"2","type":"program","attributes":{"handle":"fresh-private","state":"soft_launched"}}`
+			}
+			fmt.Fprintf(w, `{"data":[{"id":"1","type":"program","attributes":{"handle":"known-private","state":"soft_launched"}}%s],"links":{}}`, extra)
+		case "/v1/hackers/programs/fresh-private":
+			fmt.Fprint(w, `{"data":{"id":"2","type":"program","attributes":{"handle":"fresh-private","name":"Fresh Private","state":"soft_launched","policy":"p"}}}`)
+		case "/v1/hackers/me/reports":
+			state := "triaged"
+			if phase.Load() >= 1 {
+				state = "resolved"
+			}
+			fmt.Fprintf(w, `{"data":[{"id":"9","type":"report","attributes":{"state":%q}}],"links":{}}`, state)
+		case "/v1/hackers/reports/9":
+			state := "triaged"
+			if phase.Load() >= 1 {
+				state = "resolved"
+			}
+			fmt.Fprintf(w, `{"data":{"id":"9","type":"report","attributes":{"state":%q,"title":"t"}}}`, state)
+		default:
+			t.Errorf("unexpected request: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	var programMessages, reportMessages atomic.Int32
+	programHook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		programMessages.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer programHook.Close()
+	reportHook := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reportMessages.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer reportHook.Close()
+
+	cfg := testConfig(api.URL)
+	cfg.ProgramWebhookURL = programHook.URL
+	cfg.ReportWebhookURL = reportHook.URL
+	cfg.ReportNotificationMode = "summary"
+	cfg.reportDelay = time.Nanosecond
+	cfg.StateFile = filepath.Join(t.TempDir(), "fresh.db")
+
+	store, err := openStateStore(cfg.StateFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	monitor := newMonitor(cfg, store)
+
+	// First run on a brand-new database: both baselines, zero notifications.
+	if err := monitor.CheckPrograms(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.CheckReports(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if programMessages.Load() != 0 || reportMessages.Load() != 0 {
+		t.Fatalf("first run on a fresh database sent %d program and %d report messages, want 0 and 0",
+			programMessages.Load(), reportMessages.Load())
+	}
+	state, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.ProgramsInitialized || !state.ReportsInitialized {
+		t.Fatalf("fresh run did not record both baselines: programs=%v reports=%v",
+			state.ProgramsInitialized, state.ReportsInitialized)
+	}
+
+	// Everything after the baseline is notified: one new private program
+	// (summary plus HTML) and one report status change.
+	phase.Store(1)
+	if err := monitor.CheckPrograms(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := monitor.CheckReports(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if programMessages.Load() != 2 {
+		t.Fatalf("new private program sent %d messages, want 2 (summary then HTML)", programMessages.Load())
+	}
+	if reportMessages.Load() != 1 {
+		t.Fatalf("report status change sent %d messages, want 1", reportMessages.Load())
+	}
+}
+
+// TestExampleFilesAreValidAndAgree keeps config.example.json and .env.example
+// loadable and consistent with each other, so copying either one produces the
+// same behavior. Environment values override the JSON file, so a disagreement
+// between the two would silently win in the .env file's favor.
+func TestExampleFilesAreValidAndAgree(t *testing.T) {
+	t.Setenv("HACKERONE_USERNAME", "id")
+	t.Setenv("HACKERONE_API_TOKEN", "token")
+
+	cfg, err := loadConfig("config.example.json")
+	if err != nil {
+		t.Fatalf("config.example.json does not load: %v", err)
+	}
+	if cfg.programPoll != 168*time.Hour {
+		t.Errorf("example program_poll_interval = %s, want 168h", cfg.programPoll)
+	}
+	if cfg.reportPoll != 6*time.Hour {
+		t.Errorf("example report_poll_interval = %s, want 6h", cfg.reportPoll)
+	}
+	if !cfg.ProgramsEnabled || !cfg.ReportsEnabled {
+		t.Errorf("example disables a monitor: programs=%v reports=%v", cfg.ProgramsEnabled, cfg.ReportsEnabled)
+	}
+	if cfg.ReportNotificationMode != "detailed" {
+		t.Errorf("example report_notification_mode = %q, want detailed", cfg.ReportNotificationMode)
+	}
+	if !cfg.ReportNotifyOwnComments {
+		t.Error("example report_notify_own_comments is false, want true")
+	}
+	if !cfg.ReportThreadsEnabled {
+		t.Error("example report_threads_enabled is false, want true")
+	}
+
+	raw, err := os.ReadFile(".env.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := make(map[string]string)
+	for _, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, value, err := parseDotEnvLine(trimmed)
+		if err != nil {
+			t.Fatalf("`.env.example` line %q does not parse: %v", trimmed, err)
+		}
+		env[key] = value
+	}
+	for key, want := range map[string]string{
+		"HACKERBOT_PROGRAMS_ENABLED":           strconv.FormatBool(cfg.ProgramsEnabled),
+		"HACKERBOT_REPORTS_ENABLED":            strconv.FormatBool(cfg.ReportsEnabled),
+		"HACKERBOT_REPORT_NOTIFICATION_MODE":   cfg.ReportNotificationMode,
+		"HACKERBOT_REPORT_NOTIFY_OWN_COMMENTS": strconv.FormatBool(cfg.ReportNotifyOwnComments),
+		"HACKERBOT_REPORT_THREADS_ENABLED":     strconv.FormatBool(cfg.ReportThreadsEnabled),
+	} {
+		if got, exists := env[key]; !exists {
+			t.Errorf("`.env.example` is missing %s", key)
+		} else if got != want {
+			t.Errorf("`.env.example` %s = %q but config.example.json implies %q", key, got, want)
+		}
+	}
+	for _, key := range []string{"HACKERONE_USERNAME", "HACKERONE_API_TOKEN", "DISCORD_PROGRAM_WEBHOOK", "DISCORD_REPORT_WEBHOOK"} {
+		if env[key] == "" {
+			t.Errorf("`.env.example` is missing a placeholder for %s", key)
+		}
+	}
 }
