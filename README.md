@@ -10,10 +10,10 @@ Hackerbot watches for newly accepted private programs and monitors reports avail
 - Retrieves the paginated program list and watches only programs whose Hacker API state is `soft_launched` (accepted private programs).
 - Creates a silent private-program baseline on the first successful run without fetching every program's scope.
 - Notifies Discord only when a new private program appears. Existing program changes and all public programs are ignored.
-- Fetches only the program object for a newly discovered private program. Structured scopes and scope exclusions are never requested by the monitor; they are fetched only for an explicit `-handle` or `-dummy` request.
+- Fetches the complete program object, structured scopes, and scope exclusions only for a newly discovered private program (or an explicit `-handle`/`-dummy` request).
 - Sends a concise, styled Discord overview first, then uploads one complete standalone HTML program report in a second ordered message.
 - Places a visual divider between consecutive program notifications.
-- Includes the full policy, researcher-specific program statistics, and raw API snapshot in the HTML without silent truncation. A `-handle`/`-dummy` report also contains a HackerOne-style structured scope table and exclusions; scope assets are ordered Critical, High, Medium, Low, then None, with assets alphabetical inside each severity. A monitor notification states that the scope was not requested instead of showing an empty table.
+- Includes the full policy, a HackerOne-style structured scope table, exclusions, researcher-specific program statistics, and raw API snapshot in the HTML without silent truncation. Scope assets are ordered Critical, High, Medium, Low, then None, with assets alphabetical inside each severity.
 - Logs the HackerOne API request count and the Discord request count separately at the end of every interval.
 - Program and report monitoring can be disabled independently. Report monitoring covers owned reports, including new reports, status changes, comments, and every new activity type returned by the Hacker API.
 - Uses a separate Discord webhook for report notifications.
@@ -72,7 +72,7 @@ JSON settings:
 | `report_poll_interval` | `6h` | How often owned reports are checked |
 | `request_interval` | `150ms` | Shared delay between HackerOne API reads |
 | `report_request_interval` | `210ms` | Additional delay between report-list/detail reads |
-| `scope_request_interval` | `1250ms` | Additional delay between structured-scope requests. Only `-handle` and `-dummy` read structured scope, so the monitor never uses this delay |
+| `scope_request_interval` | `1250ms` | Additional delay between structured-scope requests |
 | `request_timeout` | `30s` | HTTP request timeout |
 | `state_file` | `hackerbot.db` | SQLite database, relative to the config file |
 | `programs_enabled` | `true` | Enables private-program polling; defaults to `true` when omitted for compatibility with older configurations |
@@ -285,7 +285,7 @@ Resetting the report baseline also discards the stored Discord thread IDs, so wi
 
 Program and report baselines are independent. Each first successful enabled check writes its baseline and sends no Discord notification. The program baseline contains only accepted private handles and is created directly from the list response; it does not fetch details for programs that already exist at initialization. If `programs_enabled` is false, Hackerbot makes no automatic program API calls. If `reports_enabled` is false or the report webhook is absent, report monitoring remains disabled and no report baseline is created.
 
-State is stored in the `metadata`, `programs`, and `reports` tables in `hackerbot.db`. Program handles and report IDs are primary keys. A baseline private-program row contains the program-list resource; a private program discovered later contains the complete program object used for its notification, with `scope_omitted` recording that its structured scope was never requested. SQLite runs in WAL mode and all baseline updates use transactions.
+State is stored in the `metadata`, `programs`, and `reports` tables in `hackerbot.db`. Program handles and report IDs are primary keys. A baseline private-program row contains the program-list resource; a private program discovered later contains the complete detail and scope snapshot used for its notification. SQLite runs in WAL mode and all baseline updates use transactions.
 
 After initialization, Hackerbot uses handle presence—not content comparison—to detect new private programs. It does not fetch or compare existing private-program details or scopes. A new handle is stored only after Discord accepts its notification, so a failed delivery is retried during the next poll. An incomplete HackerOne collection fails the entire check so a temporary API error cannot look like removed programs.
 
@@ -293,18 +293,18 @@ The private filter recognizes only HackerOne's `soft_launched` state and ignores
 
 Program notifications use two awaited Discord requests per program: the new-program summary is accepted first, then the timestamped HTML file is uploaded. A visual divider is sent before the next program in the batch. When several programs need notifications, handles are processed alphabetically. Inside the HTML, sections are ordered as overview, guidelines, scope, exclusions, then raw API data.
 
-A new private program therefore costs exactly one additional HackerOne request—the program object—on top of the shared program-list read. The monitor makes no structured-scope or scope-exclusion request at all, so its scope and exclusion sections state that the data was not requested rather than reporting an empty scope. Use `-handle <program>` for a complete report with the scope table when you want it.
+A newly discovered private program costs three additional HackerOne reads on top of the shared program-list read: the program object, its structured scopes, and its scope exclusions. Existing private programs cost nothing beyond that shared list read, because they are never fetched again.
 
 ## Request accounting
 
 Every check logs its own request tally when it finishes. The HackerOne API count and the Discord count are reported as two separate figures, because the two services have unrelated rate limits and a combined number would hide which side a check actually spent:
 
 ```text
-private-program check finished in 1.482s; HackerOne API: 2 requests (2 list/detail, 0 report, 0 scope) | Discord: 3 requests (1 retried)
+private-program check finished in 3.914s; HackerOne API: 4 requests (3 list/detail, 0 report, 1 scope) | Discord: 3 requests (1 retried)
 report check finished in 4.912s; HackerOne API: 8 requests (0 list/detail, 8 report, 0 scope, 1 retried) | Discord: 12 requests
 ```
 
-The HackerOne figure is broken down by the three rate-limit classes it is spaced against: `list/detail` for general reads, `report` for report-list and report-detail reads, and `scope` for structured-scope reads. The monitor never reads structured scope, so its `scope` count is always `0`; only `-handle` and `-dummy` raise it.
+The HackerOne figure is broken down by the three rate-limit classes it is spaced against: `list/detail` for general reads, `report` for report-list and report-detail reads, and `scope` for structured-scope reads. A program check raises the `scope` count only when it found a new private program, since nothing else reads structured scope.
 
 Retried requests are counted in the total for the service that was retried and reported separately as `N retried`, so a Discord rate limit can never inflate the HackerOne figure or the reverse. The counters are carried per check, so the program and report schedulers never count each other's requests even when their intervals coincide. The tally is printed whether the check succeeded or failed, and `-once`, `-handle`, and `-dummy` print it too.
 
@@ -318,7 +318,7 @@ If the configured state path contains a state file from the older JSON version, 
 - Hackerbot additionally rejects every path outside `/v1/hackers/`; customer and Program Management endpoints cannot be called by this client.
 - Hackerbot does write its own local SQLite state and uses HTTP `POST` only to deliver messages to the configured Discord webhooks.
 - The SQLite database contains private program policies/scopes and owned report data. Protect the database, its `-wal`/`-shm` files, and any JSON migration backup as confidential.
-- Program HTML attachments contain complete program information, including private-program policy, and scope data for `-handle`/`-dummy` reports. Send them only to an appropriately restricted Discord channel.
+- Program HTML attachments contain complete program information, including private-program policy and scope data. Send them only to an appropriately restricted Discord channel.
 - `summary` report mode does not send report titles or comment bodies; it does send transition targets, actors, and other activity values. `detailed` additionally sends the title and relevant comment content, but never uploads full report JSON.
 - Report thread IDs are stored in the private SQLite report snapshots. Thread creation/posting changes Discord only; HackerOne remains read-only.
 - Hackerbot disables Discord mention parsing so program policy or report text cannot ping users or roles.

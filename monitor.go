@@ -49,22 +49,6 @@ func (m *Monitor) FetchProgram(ctx context.Context, handle string) (ProgramSnaps
 	}, nil
 }
 
-// FetchProgramDetail reads only the program object. The private-program
-// monitor notifies that a program became available and does not need its
-// structured scope, so this path makes no scopeRead request at all.
-func (m *Monitor) FetchProgramDetail(ctx context.Context, handle string) (ProgramSnapshot, error) {
-	program, err := m.h1.Program(ctx, handle)
-	if err != nil {
-		return ProgramSnapshot{}, fmt.Errorf("fetch program %s: %w", handle, err)
-	}
-	return ProgramSnapshot{
-		Handle:       handle,
-		Program:      program,
-		ScopeOmitted: true,
-		CapturedAt:   time.Now().UTC(),
-	}, nil
-}
-
 func (m *Monitor) SendHandle(ctx context.Context, handle string) error {
 	snapshot, err := m.FetchProgram(ctx, handle)
 	if err != nil {
@@ -139,7 +123,7 @@ func (m *Monitor) CheckPrograms(ctx context.Context) error {
 		if _, exists := previous.Programs[handle]; exists {
 			continue
 		}
-		next, err := m.FetchProgramDetail(ctx, handle)
+		next, err := m.FetchProgram(ctx, handle)
 		if err != nil {
 			log.Printf("fetch new private program %s: %v", handle, err)
 			continue

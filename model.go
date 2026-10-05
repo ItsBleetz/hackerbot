@@ -16,12 +16,7 @@ type ProgramSnapshot struct {
 	Program         json.RawMessage   `json:"program"`
 	Scopes          []json.RawMessage `json:"scopes"`
 	ScopeExclusions []json.RawMessage `json:"scope_exclusions"`
-	// ScopeOmitted records that structured scope and scope exclusions were
-	// never requested, so an empty Scopes slice is not mistaken for a program
-	// that returned no assets. Absent in older snapshots, where scope was
-	// always fetched, so the false zero value stays correct.
-	ScopeOmitted bool      `json:"scope_omitted,omitempty"`
-	CapturedAt   time.Time `json:"captured_at"`
+	CapturedAt      time.Time         `json:"captured_at"`
 }
 
 type ReportSnapshot struct {

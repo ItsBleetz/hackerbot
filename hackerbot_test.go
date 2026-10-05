@@ -410,6 +410,10 @@ func TestProgramWatchBaselinesPrivateOnlyIgnoresChangesAndSendsNewPrivate(t *tes
 			],"links":{}}`, policy, newPrograms)
 		case "/v1/hackers/programs/new-private":
 			fmt.Fprint(w, `{"data":{"id":"3","type":"program","attributes":{"handle":"new-private","name":"New Private","state":"soft_launched","policy":"private policy"}}}`)
+		case "/v1/hackers/programs/new-private/structured_scopes":
+			fmt.Fprint(w, `{"data":[{"id":"1","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"https://private.example","eligible_for_submission":true,"eligible_for_bounty":true}}],"links":{}}`)
+		case "/v1/hackers/programs/new-private/scope_exclusions":
+			fmt.Fprint(w, `{"data":[],"links":{}}`)
 		default:
 			t.Errorf("unexpected HackerOne request: %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -476,11 +480,8 @@ func TestProgramWatchBaselinesPrivateOnlyIgnoresChangesAndSendsNewPrivate(t *tes
 		t.Fatalf("existing program snapshot changed despite change monitoring being disabled: %s", state.Programs["existing-private"].Program)
 	}
 	stored := state.Programs["new-private"]
-	if !stored.ScopeOmitted {
-		t.Fatalf("new private program snapshot does not record the omitted scope: %+v", stored)
-	}
-	if len(stored.Scopes) != 0 || len(stored.ScopeExclusions) != 0 {
-		t.Fatalf("new private program stored scope data: %+v", stored)
+	if len(stored.Scopes) != 1 {
+		t.Fatalf("new private program scope was not stored: %+v", stored)
 	}
 	if !strings.Contains(string(stored.Program), `"policy":"private policy"`) {
 		t.Fatalf("new private program detail was not stored: %s", stored.Program)
@@ -499,15 +500,13 @@ func TestProgramWatchBaselinesPrivateOnlyIgnoresChangesAndSendsNewPrivate(t *tes
 	if requests["/v1/hackers/programs/existing-private"] != 0 || requests["/v1/hackers/programs/existing-public"] != 0 || requests["/v1/hackers/programs/new-public"] != 0 {
 		t.Fatalf("existing/public program details were fetched: %v", requests)
 	}
-	if requests["/v1/hackers/programs/new-private"] != 1 {
-		t.Fatalf("new private detail requests = %d, want 1", requests["/v1/hackers/programs/new-private"])
-	}
 	for _, path := range []string{
+		"/v1/hackers/programs/new-private",
 		"/v1/hackers/programs/new-private/structured_scopes",
 		"/v1/hackers/programs/new-private/scope_exclusions",
 	} {
-		if requests[path] != 0 {
-			t.Fatalf("new-program check requested %s %d time(s); scope must not be fetched", path, requests[path])
+		if requests[path] != 1 {
+			t.Fatalf("new private request %s count = %d, want 1", path, requests[path])
 		}
 	}
 }
@@ -1217,34 +1216,39 @@ func serverURL(r *http.Request) string {
 	return "http://" + r.Host
 }
 
-func TestNewProgramNotificationStatesScopeWasNotRequested(t *testing.T) {
+func TestNewProgramNotificationCarriesStructuredScope(t *testing.T) {
 	program := json.RawMessage(`{"id":"7","type":"program","attributes":{"handle":"new-private","name":"New Private","state":"soft_launched","policy":"# Rules\n\nTest the login flow."}}`)
 	snapshot := ProgramSnapshot{
-		Handle:       "new-private",
-		Program:      program,
-		ScopeOmitted: true,
-		CapturedAt:   time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC),
+		Handle:  "new-private",
+		Program: program,
+		Scopes: []json.RawMessage{
+			json.RawMessage(`{"id":"1","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"api.private.example","eligible_for_submission":true,"eligible_for_bounty":true,"max_severity":"critical"}}`),
+			json.RawMessage(`{"id":"2","type":"structured-scope","attributes":{"asset_type":"OTHER","asset_identifier":"Private iOS app","eligible_for_submission":true,"eligible_for_bounty":false,"max_severity":"medium"}}`),
+		},
+		ScopeExclusions: []json.RawMessage{
+			json.RawMessage(`{"id":"5","type":"scope-exclusion","attributes":{"category":"Rate limiting","details":"Out of scope."}}`),
+		},
+		CapturedAt: time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC),
 	}
 	change := ProgramChange{Kind: "new", Handle: "new-private", After: &snapshot}
 
 	embed := programOverviewEmbed("New Private", objectAttributes(program), snapshot, change, "new-private-program.html")
-	var scopeField *discordEmbedField
-	for index := range embed.Fields {
-		if strings.Contains(embed.Fields[index].Name, "Scope") {
-			scopeField = &embed.Fields[index]
-		}
-		if strings.Contains(embed.Fields[index].Name, "Exclusions") {
-			t.Fatalf("embed advertises an exclusion count that was never requested: %+v", embed.Fields[index])
-		}
+	fields := make(map[string]string, len(embed.Fields))
+	for _, field := range embed.Fields {
+		fields[field.Name] = field.Value
 	}
-	if scopeField == nil {
+	scope, exists := fields["\U0001F3AF Scope"]
+	if !exists {
 		t.Fatalf("embed has no scope field: %+v", embed.Fields)
 	}
-	if !strings.Contains(scopeField.Value, "Not requested") {
-		t.Fatalf("scope field = %q, want it to say the scope was not requested", scopeField.Value)
+	if !strings.Contains(scope, "**2** assets") {
+		t.Fatalf("scope field = %q, want the asset count", scope)
 	}
-	if !strings.Contains(embed.Footer.Text, "scope not requested") {
-		t.Fatalf("footer = %q, want it to state the scope was not requested", embed.Footer.Text)
+	if !strings.Contains(scope, "Critical 1") || !strings.Contains(scope, "Medium 1") {
+		t.Fatalf("scope field = %q, want the per-severity breakdown", scope)
+	}
+	if got := fields["\U0001F6AB Exclusions"]; !strings.Contains(got, "**1** documented") {
+		t.Fatalf("exclusion field = %q, want 1 documented", got)
 	}
 
 	page, err := programHTML(change)
@@ -1252,27 +1256,23 @@ func TestNewProgramNotificationStatesScopeWasNotRequested(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := string(page)
+	if !strings.Contains(html, `<table class="scope-table"`) {
+		t.Fatal("HTML has no structured scope table")
+	}
+	for _, want := range []string{"api.private.example", "Private iOS app", "Rate limiting"} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("HTML is missing %q", want)
+		}
+	}
+	// Critical sorts ahead of Medium regardless of input order.
+	if strings.Index(html, "api.private.example") > strings.Index(html, "Private iOS app") {
+		t.Fatal("scope table is not ordered by descending severity")
+	}
 	if strings.Contains(html, "No structured scope was returned by the Hacker API.") {
-		t.Fatal("HTML claims the API returned no scope when the scope was never requested")
-	}
-	if !strings.Contains(html, "Structured scope was not requested.") {
-		t.Fatal("HTML scope section does not state that the scope was not requested")
-	}
-	if !strings.Contains(html, "Scope exclusions were not requested.") {
-		t.Fatal("HTML exclusion section does not state that exclusions were not requested")
+		t.Fatal("HTML reports an empty scope although two assets were supplied")
 	}
 	if !strings.Contains(html, "Test the login flow.") {
-		t.Fatal("HTML dropped the program policy, which the program object does carry")
-	}
-	if !strings.Contains(html, "structured_scopes") {
-		t.Fatal("HTML raw API section is missing the structured_scopes key")
-	}
-	raw, err := programJSON(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), `"structured_scopes": null`) {
-		t.Fatalf("raw API snapshot should report scope as null, not an empty collection: %s", raw)
+		t.Fatal("HTML dropped the program policy")
 	}
 }
 
@@ -1557,6 +1557,10 @@ func TestFreshDatabaseBaselinesBothMonitorsSilentlyThenNotifies(t *testing.T) {
 			fmt.Fprintf(w, `{"data":[{"id":"1","type":"program","attributes":{"handle":"known-private","state":"soft_launched"}}%s],"links":{}}`, extra)
 		case "/v1/hackers/programs/fresh-private":
 			fmt.Fprint(w, `{"data":{"id":"2","type":"program","attributes":{"handle":"fresh-private","name":"Fresh Private","state":"soft_launched","policy":"p"}}}`)
+		case "/v1/hackers/programs/fresh-private/structured_scopes":
+			fmt.Fprint(w, `{"data":[{"id":"1","type":"structured-scope","attributes":{"asset_type":"URL","asset_identifier":"fresh.example","eligible_for_submission":true,"eligible_for_bounty":true,"max_severity":"high"}}],"links":{}}`)
+		case "/v1/hackers/programs/fresh-private/scope_exclusions":
+			fmt.Fprint(w, `{"data":[],"links":{}}`)
 		case "/v1/hackers/me/reports":
 			state := "triaged"
 			if phase.Load() >= 1 {
